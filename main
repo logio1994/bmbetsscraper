@@ -1,0 +1,266 @@
+import time
+import os
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+import concurrent.futures
+import queue
+import random
+import subprocess
+
+# Konfiguracja opcji przeglądarki Chrome
+chrome_options = Options()
+# Aby zobaczyć działanie przeglądarki, nie używaj trybu headless
+# chrome_options.add_argument("--headless")
+# Wyłączenie obrazów, aby przyspieszyć ładowanie stron
+prefs = {"profile.managed_default_content_settings.images": 2}
+chrome_options.add_experimental_option("prefs", prefs)
+
+# Ścieżka do chromedrivera – dostosuj do swojej lokalizacji
+service = Service(executable_path=" ")
+
+
+def get_match_odds(match_link, max_retries=3):
+    """Dla danego linku meczu pobiera:
+       - kursy 1X2 (Home, Draw, Away)
+       - kursy Total Goals: Over 2.5 i Under 2.5
+       - kursy BTS: Both Teams To Score (BTS Yes, BTS No)
+       Zwraca słownik z wynikami.
+    """
+    result = {
+        "link": match_link,
+        "1": "",
+        "X": "",
+        "2": "",
+        "BTS Yes": "",
+        "BTS No": "",
+        "Over 2.5": "",
+        "Under 2.5": ""
+    }
+    driver = None
+    retries = 0
+
+    while retries < max_retries:
+        try:
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            wait = WebDriverWait(driver, 30)  # Zwiększony timeout
+            driver.get(match_link)
+            print(f"[{match_link}] Otwieram stronę (próba {retries + 1}/{max_retries})...")
+
+            # Poczekaj na załadowanie kursów 1X2
+            wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "td.odd-v")))
+            time.sleep(1)  # Zwiększone opóźnienie na załadowanie
+
+            # Pobranie kursów 1X2 (pierwsze 3 td.odd-v)
+            html = driver.page_source
+            soup = BeautifulSoup(html, "html.parser")
+            all_odds = soup.find_all("td", class_="odd-v")
+            if len(all_odds) >= 3:
+                result["1"] = all_odds[0].get_text(strip=True)
+                result["X"] = all_odds[1].get_text(strip=True)
+                result["2"] = all_odds[2].get_text(strip=True)
+                print(f"[{match_link}] Pobrano kursy 1X2: {result['1']}, {result['X']}, {result['2']}")
+            else:
+                print(f"[{match_link}] Nie znaleziono kursów 1X2.")
+
+            # Przejście do zakładki "Totals Goals"
+            try:
+                total_goals_tab = driver.find_element(By.XPATH, "//a[@href='#!/overunder' and contains(.,'Goals')]")
+                total_goals_tab.click()
+                print(f"[{match_link}] Przechodzę do zakładki 'Total Goals'...")
+                wait.until(EC.presence_of_element_located(
+                    (By.XPATH, "//span[contains(@class, 'caption-txt') and contains(., '+2.5')]")))
+                time.sleep(1)  # Zwiększone opóźnienie
+                html2 = driver.page_source
+                soup2 = BeautifulSoup(html2, "html.parser")
+                total_caption = None
+                for span in soup2.find_all("span", class_="caption-txt"):
+                    if "+2.5" in span.get_text():
+                        total_caption = span
+                        break
+                if total_caption:
+                    parent_tr = total_caption.find_parent("tr")
+                    if parent_tr:
+                        odds_elements = parent_tr.find_all("td", class_="odd-v")
+                    else:
+                        odds_elements = total_caption.find_all_next("td", class_="odd-v")
+                    if len(odds_elements) >= 2:
+                        result["Over 2.5"] = odds_elements[0].get_text(strip=True)
+                        result["Under 2.5"] = odds_elements[1].get_text(strip=True)
+                        print(
+                            f"[{match_link}] Pobrano kursy Total Goals: Over 2.5={result['Over 2.5']}, Under 2.5={result['Under 2.5']}")
+                else:
+                    print(f"[{match_link}] Nie znaleziono kursów Total Goals.")
+            except Exception as e:
+                print(f"[{match_link}] Problem z Total Goals: {e}")
+
+            # Rozwinięcie menu – kliknięcie ikony fa-chevron-down
+            try:
+                chevron = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "i.fa.fa-chevron-down")))
+                driver.execute_script("arguments[0].scrollIntoView();", chevron)
+                time.sleep(1)  # Zwiększone opóźnienie
+                chevron.click()
+                print(f"[{match_link}] Rozwijam menu...")
+            except Exception as e:
+                print(f"[{match_link}] Problem z rozwinięciem menu: {e}")
+
+            time.sleep(1)  # Zwiększone opóźnienie przed przejściem do BTS
+
+            # Lokalizacja i kliknięcie przycisku BTS
+            try:
+                bts_button = wait.until(EC.element_to_be_clickable(
+                    (By.XPATH,
+                     "//li[@class='menu-item' and @title='Both Teams To Score']/a[@href='#!/both-teams-to-score' and @data-id='304']")))
+                driver.execute_script("arguments[0].scrollIntoView();", bts_button)
+                time.sleep(1)  # Zwiększone opóźnienie
+                bts_button.click()
+                print(f"[{match_link}] Przechodzę do zakładki BTS...")
+            except Exception as e:
+                print(f"[{match_link}] Problem z kliknięciem BTS: {e}")
+                if driver:
+                    driver.quit()
+                return result
+
+            time.sleep(1)  # Zwiększone opóźnienie na załadowanie zakładki BTS
+
+            # Pobranie kursów BTS
+            html_bts = driver.page_source
+            soup_bts = BeautifulSoup(html_bts, "html.parser")
+            bts_odds_elements = soup_bts.find_all("td", class_="odd-v")
+            if len(bts_odds_elements) >= 2:
+                result["BTS Yes"] = bts_odds_elements[0].get_text(strip=True)
+                result["BTS No"] = bts_odds_elements[1].get_text(strip=True)
+                print(f"[{match_link}] Pobrano kursy BTS: Yes={result['BTS Yes']}, No={result['BTS No']}")
+            else:
+                print(f"[{match_link}] Nie znaleziono kursów BTS.")
+
+            if driver:
+                driver.quit()
+            return result  # Jeśli wszystko działa, zwróć wynik
+
+        except Exception as ex:
+            print(f"[{match_link}] Ogólny błąd (próba {retries + 1}/{max_retries}): {ex}")
+            if driver:
+                driver.quit()
+            retries += 1
+            if retries < max_retries:
+                print(f"[{match_link}] Ponawiam próbę za 5 sekund...")
+                time.sleep(2)  # Poczekaj 5 sekund przed ponowną próbą
+            else:
+                print(f"[{match_link}] Przekroczono maksymalną liczbę prób.")
+                return result  # Zwróć częściowy wynik po przekroczeniu liczby prób
+
+
+def worker(link_queue, result_queue):
+    """Funkcja wykonywana w każdym wątku."""
+    while not link_queue.empty():
+        link = link_queue.get()
+        time.sleep(random.uniform(1, 3))  # Zwiększone losowe opóźnienie od 3 do 5 sekund
+        odds = get_match_odds(link)
+        result_queue.put(odds)
+        link_queue.task_done()
+
+
+def start_scraping():
+    # Sprawdź, czy plik kursy_meczu.xlsx istnieje, i usuń go, jeśli tak
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    file_path = os.path.join(desktop_path, "kursy_meczu.xlsx")
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            print("Usunięto istniejący plik kursy_meczu.xlsx")
+        except Exception as e:
+            print(f"Błąd podczas usuwania pliku: {e}")
+
+    # Pobieramy linki z okna tekstowego (każdy link w osobnej linii)
+    raw_links = text_box.get("1.0", tk.END).strip()
+    if not raw_links:
+        messagebox.showwarning("Brak linków", "Wklej przynajmniej jeden link!")
+        return
+    links = [line.strip() for line in raw_links.splitlines() if line.strip()]
+    results = []
+    total = len(links)
+    status_label.config(text=f"Przetwarzam 0/{total} meczów...")
+    root.update()
+
+    try:
+        # Przetwarzamy linki kolejno, aby zachować kolejność
+        for i, link in enumerate(links, start=1):
+            status_label.config(text=f"Przetwarzam mecz {i}/{total}...")
+            root.update()
+            print(f"Przetwarzanie linku {i}: {link}")
+            odds = get_match_odds(link)
+            results.append(odds)
+            print(f"Zakończono przetwarzanie linku {i}")
+
+        status_label.config(text="Przetwarzanie zakończone!")
+
+        # Przygotowanie danych do zapisu – kolumny: Link, 1, X, 2, BTS Yes, BTS No, Over 2.5, Under 2.5
+        df = pd.DataFrame(results)
+        # Ustalamy kolejność kolumn
+        df = df[["link", "1", "X", "2", "BTS Yes", "BTS No", "Over 2.5", "Under 2.5"]]
+
+        # Zmiana separatora dziesiętnego z kropki na przecinek dla kursów (pomijamy kolumnę link)
+        for col in ["1", "X", "2", "BTS Yes", "BTS No", "Over 2.5", "Under 2.5"]:
+            df[col] = df[col].apply(lambda x: x.replace('.', ',') if isinstance(x, str) else x)
+
+        # Zapis do pliku Excel na pulpicie – nazwa pliku: kursy_meczu.xlsx
+        try:
+            df.to_excel(file_path, index=False)
+            print(f"Zapisano plik: {file_path}")
+
+            # Wyświetlenie komunikatu, który zamknie się automatycznie po 3 sekundach
+            info_window = tk.Toplevel(root)
+            info_window.title("Gotowe")
+            label = tk.Label(info_window, text=f"Kursy zapisane do pliku:\n{file_path}", font=("Arial", 12))
+            label.pack(padx=20, pady=20)
+            subprocess.Popen(["python", ""])
+
+
+            # Zamknięcie okna komunikatu po 3 sekundach
+            info_window.after(3000, info_window.destroy)
+
+            # Zamknięcie głównego okna aplikacji po zamknięciu komunikatu
+            info_window.after(3000, root.destroy)
+
+            # Uruchomienie drugiego programu po zamknięciu głównego okna
+            info_window.after(3000, lambda: subprocess.run(["python", r""]))
+
+        except Exception as e:
+            print(f"Błąd podczas zapisywania pliku: {e}")
+            messagebox.showerror("Błąd", f"Nie udało się zapisać pliku: {e}")
+
+    except Exception as e:
+        print(f"Błąd podczas przetwarzania linków: {e}")
+        messagebox.showerror("Błąd", f"Wystąpił błąd podczas przetwarzania linków: {e}")
+
+
+# --- GUI ---
+root = tk.Tk()
+root.title("Pobieranie kursów meczów")
+root.state("zoomed")  # maksymalizujemy okno
+
+# Etykieta
+label = tk.Label(root, text="Wklej linki (jeden link na linię):", font=("Arial", 14))
+label.pack(pady=10)
+
+# Pole tekstowe z paskiem przewijania
+text_box = scrolledtext.ScrolledText(root, width=100, height=20, font=("Arial", 12))
+text_box.pack(padx=20, pady=10)
+
+# Przycisk start
+start_button = tk.Button(root, text="Start", font=("Arial", 14), command=start_scraping)
+start_button.pack(pady=10)
+
+# Etykieta statusu
+status_label = tk.Label(root, text="Oczekiwanie na rozpoczęcie...", font=("Arial", 12))
+status_label.pack(pady=10)
+
+root.mainloop()
